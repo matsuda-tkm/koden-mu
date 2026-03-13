@@ -5,7 +5,7 @@
 電力マップをフレームとして合成し、GIFアニメーションとして出力する。
 
 Usage:
-    uv run scripts/make_power_gif.py <input_dir> [--output OUTPUT_GIF]
+    uv run scripts/make_power_gif.py <input_dir> --output OUTPUT_GIF
                                      [--fps FPS] [--azi-num AZI_NUM]
                                      [--vmin VMIN] [--vmax VMAX]
                                      [--skip-first]
@@ -19,10 +19,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-from koden_mu.radar import coordinate, make_colormap, read_iq, to_dbm
-from koden_mu.radar import RNG_NUM
+from koden_mu.radar import RNG_NUM, coordinate, make_colormap, read_iq, to_dbm
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
+
 
 
 def main() -> None:
@@ -33,8 +33,8 @@ def main() -> None:
     parser.add_argument("input_dir", help="入力 .bin ファイルが格納されたディレクトリ")
     parser.add_argument(
         "--output",
-        default=None,
-        help="出力GIFのパス（省略時は <input_dir>/<dirname>.gif）",
+        required=True,
+        help="出力GIFのパス",
     )
     parser.add_argument(
         "--fps",
@@ -80,11 +80,7 @@ def main() -> None:
         if not bin_files:
             raise SystemExit("エラー: スキップ後に処理対象のファイルがありません。")
 
-    output_path = (
-        Path(args.output)
-        if args.output
-        else input_dir / f"{input_dir.resolve().name}.gif"
-    )
+    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"処理対象: {len(bin_files)} ファイル -> {output_path}")
@@ -105,13 +101,22 @@ def main() -> None:
     cbar.set_label("Power [dBm]", fontname="Arial", fontsize=10)
     title = ax.set_title("")
 
+    skipped = 0
+
     def update(frame_idx: int) -> tuple:
+        nonlocal skipped
         bin_path = bin_files[frame_idx]
         print(f"  [{frame_idx + 1}/{len(bin_files)}] {bin_path.name}")
-        iq = read_iq(str(bin_path), args.azi_num)
-        dbm = to_dbm(iq)
-        mesh.set_array(dbm.ravel())
-        title.set_text(bin_path.stem)
+        try:
+            iq = read_iq(str(bin_path), args.azi_num)
+            dbm = to_dbm(iq)
+            # -inf / nan（全ゼロIQなど）を vmin にクランプしてカラーマップ異常を防ぐ
+            dbm = np.nan_to_num(dbm, nan=args.vmin, posinf=args.vmax, neginf=args.vmin)
+            mesh.set_array(dbm.ravel())
+            title.set_text(bin_path.stem)
+        except Exception as e:
+            print(f"    警告: スキップ ({e})")
+            skipped += 1
         return mesh, title
 
     ani = FuncAnimation(
@@ -122,12 +127,12 @@ def main() -> None:
         repeat=False,
     )
 
-    interval_ms = int(1000 / args.fps)
     writer = PillowWriter(fps=args.fps)
     ani.save(str(output_path), writer=writer, dpi=150)
     plt.close(fig)
 
-    print(f"GIF保存完了: {output_path}  (interval={interval_ms}ms/frame)")
+    interval_ms = int(1000 / args.fps)
+    print(f"GIF保存完了: {output_path}  (interval={interval_ms}ms/frame, スキップ={skipped}件)")
 
 
 if __name__ == "__main__":

@@ -2,11 +2,21 @@
 
 株式会社光電製作所の簡易型気象レーダー試作機（プロジェクト番号 #1800077）で取得したIQデータを解析・可視化するPythonスクリプト集です。
 
+## リポジトリ構成
+
+```
+src/koden_mu/radar.py        # レーダー処理の共通定数・関数ライブラリ
+scripts/process_iq.py        # 単一 .bin を処理して PNG / NPZ を生成
+scripts/make_power_gif.py    # ディレクトリ内の .bin を一括処理して GIF を生成
+scripts/plot_doppler_sample.py  # NPZ からドップラースペクトルを表示
+```
+
 ## スクリプト概要
 
 | スクリプト | 説明 |
 |---|---|
 | `scripts/process_iq.py` | IQデータ（`.bin`）を読み込み、受信電力マップの描画とNPZファイルへの保存を行う |
+| `scripts/make_power_gif.py` | ディレクトリ内の全 `.bin` を一括処理し、電力マップのGIFアニメーションを生成する |
 | `scripts/plot_doppler_sample.py` | NPZファイルを読み込み、指定したゲートのドップラースペクトルをプロットする |
 
 ## 環境構築
@@ -43,7 +53,29 @@ uv run scripts/process_iq.py <IQデータファイル.bin>
 | `doppler` | `(10, 2048, 200)` | ドップラー電力スペクトル [dB]。仰角 × レンジ × 速度ビンの3次元配列 |
 | `velocity` | `(200,)` | ドップラー速度軸 [m/s]。最大不曖昧速度の範囲でfftshift済み |
 
-### 2. ドップラースペクトルの表示（`plot_doppler_sample.py`）
+### 2. 電力マップGIFの生成（`make_power_gif.py`）
+
+```bash
+uv run scripts/make_power_gif.py <IQデータディレクトリ> --output <出力.gif>
+```
+
+ディレクトリ内の `.bin` ファイルをファイル名順に処理し、各ファイルの PPI 電力マップをフレームとして合成したGIFアニメーションを生成します。
+
+```bash
+# 例：2fps、最初のファイルをスキップして生成
+uv run scripts/make_power_gif.py D:/IQ_data --output D:/result.gif --fps 2 --skip-first
+```
+
+| オプション | デフォルト | 説明 |
+|---|---|---|
+| `--output` | （必須） | 出力GIFのパス |
+| `--fps` | `2.0` | GIFのフレームレート |
+| `--azi-num` | `10` | 処理する方位数 |
+| `--vmin` | `-130` | カラースケール最小値 [dBm] |
+| `--vmax` | `-50` | カラースケール最大値 [dBm] |
+| `--skip-first` | オフ | 最初の `_0000.bin` をスキップ |
+
+### 3. ドップラースペクトルの表示（`plot_doppler_sample.py`）
 
 ```bash
 uv run scripts/plot_doppler_sample.py <NPZファイル.npz>
