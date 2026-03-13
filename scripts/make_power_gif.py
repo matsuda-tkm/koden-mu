@@ -71,7 +71,7 @@ def main() -> None:
     if not input_dir.is_dir():
         raise SystemExit(f"エラー: ディレクトリが存在しません: {input_dir}")
 
-    bin_files = sorted(input_dir.glob("*.bin"))
+    bin_files = sorted(p for p in input_dir.glob("*.bin") if p.is_file())
     if not bin_files:
         raise SystemExit(f"エラー: .bin ファイルが見つかりません: {input_dir}")
 
