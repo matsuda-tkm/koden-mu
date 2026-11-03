@@ -210,3 +210,7 @@ __marimo__/
 data/
 fig/
 data_processed/
+
+# IQ data (large binary files)
+IQdata_*/
+*.bin
