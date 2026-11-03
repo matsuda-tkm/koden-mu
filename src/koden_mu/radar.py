@@ -139,9 +139,100 @@ def doppler_velocity() -> np.ndarray:
 
     Returns:
         shape (HIT_NUM,) のドップラー速度配列 [m/s]。
-        最大不曖昧速度 (Vmax) の範囲にロールシフトされた順で並ぶ。
+        ナイキスト速度 (Vmax) の範囲にロールシフトされた順で並ぶ。
     """
     v_max = (SPEED_OF_LIGHT / RADAR_FREQ) * PRF / 2
     velo = v_max * np.arange(HIT_NUM) / HIT_NUM
     velo[HIT_NUM // 2 + 1 :] -= v_max
     return np.roll(velo, HIT_NUM // 2 - 1)
+
+
+BLOCK_SIZE: int = 1040  # 1ブロックのバイト数（ヘッダー16B + データ1024B）
+
+
+def read_sweeps(input_file: str) -> np.ndarray:
+    """バイナリファイルの全スウィープを読み込み、校正済みの複素IQ配列を返す。
+
+    ヘッダーを一括で解析するため、read_iq より高速に読み込める。
+    書き込みが途中で終わったファイルにも対応するため、I/Q と 4 分割の
+    8 ブロックがすべてそろっているスウィープだけを返す。
+
+    Args:
+        input_file: 読み込むバイナリIQデータファイルのパス。
+
+    Returns:
+        複素IQ配列。shape は (スウィープ数, RNG_NUM)。
+        スウィープは記録順に並び、HIT_NUM 個ごとに 1 方位（傾き）に対応する。
+    """
+    chunk = RNG_NUM // 4
+    raw = np.fromfile(input_file, dtype=np.uint8)
+    n_block = len(raw) // BLOCK_SIZE
+    if n_block == 0:
+        return np.zeros((0, RNG_NUM), dtype=complex)
+    blocks = raw[: n_block * BLOCK_SIZE].reshape(n_block, BLOCK_SIZE)
+    iq_flag = blocks[:, 4:6].copy().view("<u2").ravel()
+    div_num = blocks[:, 8:12].copy().view("<u4").ravel()
+    sweep_num = blocks[:, 12:16].copy().view("<u4").ravel()
+    payload = blocks[:, 16:].copy().view("<i2")
+
+    valid = (iq_flag <= 1) & (div_num <= 3)
+    n_sweep = int(sweep_num[valid].max()) + 1 if valid.any() else 0
+    data = np.zeros((2, n_sweep, RNG_NUM), dtype=np.int16)
+    filled = np.zeros((n_sweep, 8), dtype=bool)
+    for f, d, s, row in zip(
+        iq_flag[valid], div_num[valid], sweep_num[valid], payload[valid]
+    ):
+        data[f, s, d * chunk : (d + 1) * chunk] = row
+        filled[s, f * 4 + d] = True
+    data = data[:, filled.all(axis=1)]
+
+    amplitude = np.sign(data) * 2.0 ** (np.abs(data) / 2.0**9)
+    iq = amplitude[0] + 1j * amplitude[1]
+    iq[:, :CAL_BOUNDARY] *= 10 ** (CAL_NEAR_DB / 20)
+    iq[:, CAL_BOUNDARY:] *= 10 ** (CAL_FAR_DB / 20)
+    return iq
+
+
+def compute_profile(
+    iq: np.ndarray, clutter_bins: int = 2, snr_min_db: float = -3.0
+) -> dict[str, np.ndarray]:
+    """1ファイル分のIQから、レンジごとの電力と平均ドップラー速度を計算する。
+
+    HIT_NUM ヒットごとに FFT したスペクトルを全方位で平均してから計算する。
+    ゼロ速度付近（片側 clutter_bins ビン）は静止物の反射とみなして除外する。
+    平均ドップラー速度は、速度ビン方向の中央値を雑音レベルとして差し引いた
+    スペクトルの重心とする。
+
+    Args:
+        iq: read_sweeps が返す複素IQ配列。shape は (スウィープ数, RNG_NUM)。
+        clutter_bins: 除外するゼロ速度付近のビン数（片側）。
+        snr_min_db: 平均ドップラー速度を求める信号対雑音比の下限 [dB]。
+            下回るレンジは NaN にする。
+
+    Returns:
+        以下のキーを持つ辞書。値はすべて shape (RNG_NUM,)。
+            total: 全速度ビンの平均電力 [dBm]
+            moving: ゼロ速度付近を除いた電力 [dBm]
+            mean_velocity: 平均ドップラー速度 [m/s]。正がレーダーへ近づく向き
+            snr: 信号対雑音比 [dB]
+    """
+    n_azi = iq.shape[0] // HIT_NUM
+    blocks = iq[: n_azi * HIT_NUM].reshape(n_azi, HIT_NUM, RNG_NUM)
+    total = np.mean(np.abs(blocks) ** 2, axis=(0, 1))
+    spec = (np.abs(np.fft.fft(blocks, axis=1)) ** 2 / HIT_NUM**2).mean(axis=0)
+
+    keep = np.abs(np.fft.fftfreq(HIT_NUM) * HIT_NUM) > clutter_bins
+    velocity = np.fft.fftfreq(HIT_NUM) * PRF * (SPEED_OF_LIGHT / RADAR_FREQ) / 2
+    noise = np.median(spec, axis=0)
+    signal = np.clip(spec[keep] - noise, 0, None)
+    signal_power = signal.sum(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        snr = 10 * np.log10(signal_power / (noise * keep.sum()))
+        mean_velocity = (velocity[keep, None] * signal).sum(axis=0) / signal_power
+    mean_velocity[~(snr >= snr_min_db)] = np.nan
+    return {
+        "total": 10 * np.log10(total),
+        "moving": 10 * np.log10(spec[keep].sum(axis=0)),
+        "mean_velocity": mean_velocity,
+        "snr": snr,
+    }
