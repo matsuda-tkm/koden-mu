@@ -139,7 +139,7 @@ def doppler_velocity() -> np.ndarray:
 
     Returns:
         shape (HIT_NUM,) のドップラー速度配列 [m/s]。
-        最大不曖昧速度 (Vmax) の範囲にロールシフトされた順で並ぶ。
+        ナイキスト速度 (Vmax) の範囲にロールシフトされた順で並ぶ。
     """
     v_max = (SPEED_OF_LIGHT / RADAR_FREQ) * PRF / 2
     velo = v_max * np.arange(HIT_NUM) / HIT_NUM
