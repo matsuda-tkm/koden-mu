@@ -214,3 +214,6 @@ data_processed/
 # IQ data (large binary files)
 IQdata_*/
 *.bin
+
+# Web アプリの処理結果のキャッシュ
+webapp/cache/
