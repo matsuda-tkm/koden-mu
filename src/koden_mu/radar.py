@@ -18,6 +18,9 @@ PRF: float = 2400.0  # パルス繰り返し周波数 [Hz]
 CAL_BOUNDARY: int = 213  # キャリブレーション切替レンジゲート
 CAL_NEAR_DB: float = -387.7  # 近距離補正係数 [dB]
 CAL_FAR_DB: float = -398.1  # 遠距離補正係数 [dB]
+# 記録ソフトの書き込みの遅れが増える割合。2026-11-03 の追加観測で測った
+# 取り込み（約 3.1 MB/s）と書き込み（約 2.1 MB/s）の速さから求めた値
+OBS_DELAY_RATE: float = 0.30
 
 _RADAR_COLORS: list[str] = [
     "#FFFFFF",
@@ -150,7 +153,14 @@ def doppler_velocity() -> np.ndarray:
 BLOCK_SIZE: int = 1040  # 1ブロックのバイト数（ヘッダー16B + データ1024B）
 
 
-def read_sweeps(input_file: str) -> np.ndarray:
+# 記録値（uint16 として解釈した int16）から線形振幅への変換表
+_CODES = np.arange(2**16, dtype=np.uint16).view(np.int16).astype(float)
+_AMPLITUDE_TABLE = np.sign(_CODES) * 2.0 ** (np.abs(_CODES) / 2.0**9)
+
+
+def read_sweeps(
+    input_file: str, return_angles: bool = False
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """バイナリファイルの全スウィープを読み込み、校正済みの複素IQ配列を返す。
 
     ヘッダーを一括で解析するため、read_iq より高速に読み込める。
@@ -159,38 +169,85 @@ def read_sweeps(input_file: str) -> np.ndarray:
 
     Args:
         input_file: 読み込むバイナリIQデータファイルのパス。
+        return_angles: True のとき、各スウィープの方位角も返す。
 
     Returns:
         複素IQ配列。shape は (スウィープ数, RNG_NUM)。
         スウィープは記録順に並び、HIT_NUM 個ごとに 1 方位（傾き）に対応する。
+        return_angles が True のときは (IQ配列, 方位角 [deg]) のタプルを返す。
+        方位角は -180〜180 deg に変換する（鉛直観測では鉛直からの傾き）。
     """
     chunk = RNG_NUM // 4
     raw = np.fromfile(input_file, dtype=np.uint8)
     n_block = len(raw) // BLOCK_SIZE
     if n_block == 0:
-        return np.zeros((0, RNG_NUM), dtype=complex)
+        empty = np.zeros((0, RNG_NUM), dtype=complex)
+        return (empty, np.zeros(0)) if return_angles else empty
     blocks = raw[: n_block * BLOCK_SIZE].reshape(n_block, BLOCK_SIZE)
     iq_flag = blocks[:, 4:6].copy().view("<u2").ravel()
+    deg = blocks[:, 6:8].copy().view("<u2").ravel() * 0.25
     div_num = blocks[:, 8:12].copy().view("<u4").ravel()
     sweep_num = blocks[:, 12:16].copy().view("<u4").ravel()
     payload = blocks[:, 16:].copy().view("<i2")
 
-    valid = (iq_flag <= 1) & (div_num <= 3)
-    n_sweep = int(sweep_num[valid].max()) + 1 if valid.any() else 0
-    data = np.zeros((2, n_sweep, RNG_NUM), dtype=np.int16)
-    filled = np.zeros((n_sweep, 8), dtype=bool)
-    for f, d, s, row in zip(
-        iq_flag[valid], div_num[valid], sweep_num[valid], payload[valid]
-    ):
-        data[f, s, d * chunk : (d + 1) * chunk] = row
-        filled[s, f * 4 + d] = True
-    data = data[:, filled.all(axis=1)]
+    valid = np.flatnonzero((iq_flag <= 1) & (div_num <= 3))
+    # 同じスウィープの同じ部分のブロックが複数ある場合は、最後のブロックを使う。
+    # 一括代入ではインデックスが重複したときにどの値が残るか保証されないため、
+    # 先に重複を除く
+    slot = sweep_num[valid].astype(np.int64) * 8 + iq_flag[valid] * 4 + div_num[valid]
+    _, last = np.unique(slot[::-1], return_index=True)
+    rows = valid[len(valid) - 1 - last]
+    f, d, s = iq_flag[rows], div_num[rows], sweep_num[rows]
 
-    amplitude = np.sign(data) * 2.0 ** (np.abs(data) / 2.0**9)
-    iq = amplitude[0] + 1j * amplitude[1]
+    n_sweep = int(s.max()) + 1 if len(rows) else 0
+    data = np.zeros((2, n_sweep, 4, chunk), dtype=np.int16)
+    data[f, s, d] = payload[rows]
+    filled = np.zeros((n_sweep, 8), dtype=bool)
+    filled[s, f * 4 + d] = True
+    # 1 スウィープ内のブロックで方位角が 0.25 deg 異なる場合がある。
+    # ファイル内で最後のブロックの方位角を、そのスウィープの方位角とする
+    last_row = np.full(n_sweep, -1)
+    np.maximum.at(last_row, s, rows)
+    angle = np.where(last_row >= 0, deg[last_row], 0.0)
+    complete = filled.all(axis=1)
+    data = data.reshape(2, n_sweep, RNG_NUM)[:, complete].view(np.uint16)
+    del raw, blocks, payload
+
+    # 記録値（16 bit）から振幅への変換は、取り得る全値の変換表を引いて求める。
+    # 配列全体で計算すると、ファイルの十数倍の一時配列ができてメモリを消費するため
+    iq = np.empty(data.shape[1:], dtype=complex)
+    iq.real = _AMPLITUDE_TABLE[data[0]]
+    iq.imag = _AMPLITUDE_TABLE[data[1]]
     iq[:, :CAL_BOUNDARY] *= 10 ** (CAL_NEAR_DB / 20)
     iq[:, CAL_BOUNDARY:] *= 10 ** (CAL_FAR_DB / 20)
+    if return_angles:
+        return iq, (angle[complete] + 180) % 360 - 180
     return iq
+
+
+def mean_spectrum(iq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """HIT_NUM ヒットごとのドップラー電力スペクトルを全方位で平均する。
+
+    メモリの消費を抑えるため、1 方位ずつ FFT して足し合わせる。
+
+    Args:
+        iq: read_sweeps が返す複素IQ配列。shape は (スウィープ数, RNG_NUM)。
+
+    Returns:
+        (スペクトル, 方位ごとの平均電力) のタプル。
+            スペクトル: shape (HIT_NUM, RNG_NUM) の線形電力。速度ビンは FFT の順
+            （fftshift していない）に並ぶ
+            方位ごとの平均電力: shape (方位数, RNG_NUM) の線形電力
+    """
+    n_azi = iq.shape[0] // HIT_NUM
+    spec = np.zeros((HIT_NUM, RNG_NUM))
+    power = np.empty((n_azi, RNG_NUM))
+    for a in range(n_azi):
+        block = iq[a * HIT_NUM : (a + 1) * HIT_NUM]
+        power[a] = np.mean(np.abs(block) ** 2, axis=0)
+        spec += np.abs(np.fft.fft(block, axis=0)) ** 2
+    spec /= HIT_NUM**2 * n_azi
+    return spec, power
 
 
 def compute_profile(
@@ -216,10 +273,8 @@ def compute_profile(
             mean_velocity: 平均ドップラー速度 [m/s]。正がレーダーへ近づく向き
             snr: 信号対雑音比 [dB]
     """
-    n_azi = iq.shape[0] // HIT_NUM
-    blocks = iq[: n_azi * HIT_NUM].reshape(n_azi, HIT_NUM, RNG_NUM)
-    total = np.mean(np.abs(blocks) ** 2, axis=(0, 1))
-    spec = (np.abs(np.fft.fft(blocks, axis=1)) ** 2 / HIT_NUM**2).mean(axis=0)
+    spec, power = mean_spectrum(iq)
+    total = power.mean(axis=0)
 
     keep = np.abs(np.fft.fftfreq(HIT_NUM) * HIT_NUM) > clutter_bins
     velocity = np.fft.fftfreq(HIT_NUM) * PRF * (SPEED_OF_LIGHT / RADAR_FREQ) / 2
@@ -236,3 +291,51 @@ def compute_profile(
         "mean_velocity": mean_velocity,
         "snr": snr,
     }
+
+
+def fix_timestamps(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """後から上書きされたファイルの時刻を、前後のファイルの時刻から補間する。
+
+    上書きされたファイルは更新時刻が取得時刻と大きく異なるため、
+    前後 10 ファイルの中央値から 120 秒以上ずれた時刻を補間の対象にする。
+
+    Args:
+        times: ファイル名順に並べた各ファイルの更新時刻（UNIX 時間 [s]）。
+
+    Returns:
+        (補間後の時刻, 補間したファイルを True とする配列)
+    """
+    idx = np.arange(len(times))
+    med = np.array([np.median(times[max(0, i - 10) : i + 11]) for i in idx])
+    bad = np.abs(times - med) > 120
+    fixed = times.copy()
+    if bad.any() and (~bad).any():
+        fixed[bad] = np.interp(idx[bad], idx[~bad], times[~bad])
+    return fixed, bad
+
+
+def estimate_observation_time(
+    times: np.ndarray, segment_start: np.ndarray, alpha: float = OBS_DELAY_RATE
+) -> np.ndarray:
+    """ファイルの更新時刻から、観測時刻を推定する。
+
+    記録ソフトは書き込みが取り込みに追いつかないため、未書き込みのデータが
+    バッファに溜まり、更新時刻は観測時刻より少しずつ遅れていく。約 17 分で
+    バッファが一杯になると、書きかけのファイルが途中で切れ、溜まっていたデータ
+    （約 5 分）が失われて最新の観測から記録が再開される。この遅れを、区間の
+    先頭からの経過時間に比例するとみなして補正する（t' = t - alpha (t - t_s)）。
+
+    Args:
+        times: ファイル名順に並べた各ファイルの更新時刻（UNIX 時間 [s]）。
+        segment_start: 区間の先頭のファイルを True とする配列。記録が途中で
+            途切れたファイルと、記録の最初のファイルが区間の先頭になる。
+        alpha: 遅れが増える割合。
+
+    Returns:
+        推定観測時刻（UNIX 時間 [s]）。
+    """
+    idx = np.arange(len(times))
+    start = np.where(segment_start, idx, 0)
+    start[0] = 0
+    seg_time = times[np.maximum.accumulate(start)]
+    return times - alpha * (times - seg_time)

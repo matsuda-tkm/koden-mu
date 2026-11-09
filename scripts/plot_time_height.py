@@ -27,6 +27,7 @@ from koden_mu.radar import (
     RNG_NUM,
     RNG_STEP,
     compute_profile,
+    fix_timestamps,
     read_sweeps,
 )
 
@@ -47,24 +48,6 @@ def list_files(input_dir: Path) -> list[Path]:
         for p in input_dir.glob("*.bin")
         if not p.name.endswith("_0000.bin") and p.stat().st_size >= min_size
     )
-
-
-def fix_timestamps(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """後から上書きされたファイルの時刻を、前後のファイルの時刻から補間する。
-
-    上書きされたファイルは更新時刻が取得時刻と大きく異なるため、
-    前後 10 ファイルの中央値から 120 秒以上ずれた時刻を補間の対象にする。
-
-    Returns:
-        (補間後の時刻, 補間したファイルを True とする配列)
-    """
-    idx = np.arange(len(times))
-    med = np.array([np.median(times[max(0, i - 10) : i + 11]) for i in idx])
-    bad = np.abs(times - med) > 120
-    fixed = times.copy()
-    if bad.any() and (~bad).any():
-        fixed[bad] = np.interp(idx[bad], idx[~bad], times[~bad])
-    return fixed, bad
 
 
 def plot(
