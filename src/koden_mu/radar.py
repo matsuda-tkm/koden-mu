@@ -190,19 +190,27 @@ def read_sweeps(
     sweep_num = blocks[:, 12:16].copy().view("<u4").ravel()
     payload = blocks[:, 16:].copy().view("<i2")
 
-    valid = (iq_flag <= 1) & (div_num <= 3)
-    n_sweep = int(sweep_num[valid].max()) + 1 if valid.any() else 0
-    data = np.zeros((2, n_sweep, RNG_NUM), dtype=np.int16)
+    valid = np.flatnonzero((iq_flag <= 1) & (div_num <= 3))
+    # 同じスウィープの同じ部分のブロックが複数ある場合は、最後のブロックを使う。
+    # 一括代入ではインデックスが重複したときにどの値が残るか保証されないため、
+    # 先に重複を除く
+    slot = sweep_num[valid].astype(np.int64) * 8 + iq_flag[valid] * 4 + div_num[valid]
+    _, last = np.unique(slot[::-1], return_index=True)
+    rows = valid[len(valid) - 1 - last]
+    f, d, s = iq_flag[rows], div_num[rows], sweep_num[rows]
+
+    n_sweep = int(s.max()) + 1 if len(rows) else 0
+    data = np.zeros((2, n_sweep, 4, chunk), dtype=np.int16)
+    data[f, s, d] = payload[rows]
     filled = np.zeros((n_sweep, 8), dtype=bool)
-    angle = np.zeros(n_sweep)
-    for f, d, s, a, row in zip(
-        iq_flag[valid], div_num[valid], sweep_num[valid], deg[valid], payload[valid]
-    ):
-        data[f, s, d * chunk : (d + 1) * chunk] = row
-        filled[s, f * 4 + d] = True
-        angle[s] = a
+    filled[s, f * 4 + d] = True
+    # 1 スウィープ内のブロックで方位角が 0.25 deg 異なる場合がある。
+    # ファイル内で最後のブロックの方位角を、そのスウィープの方位角とする
+    last_row = np.full(n_sweep, -1)
+    np.maximum.at(last_row, s, rows)
+    angle = np.where(last_row >= 0, deg[last_row], 0.0)
     complete = filled.all(axis=1)
-    data = data[:, complete].view(np.uint16)
+    data = data.reshape(2, n_sweep, RNG_NUM)[:, complete].view(np.uint16)
     del raw, blocks, payload
 
     # 記録値（16 bit）から振幅への変換は、取り得る全値の変換表を引いて求める。
